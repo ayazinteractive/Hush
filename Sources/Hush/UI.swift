@@ -11,6 +11,12 @@ final class MixerModel: ObservableObject {
 
     private var taps: [String: AppTap] = [:]
 
+    /// Apps whose tap couldn't be created, with when and why. Keeps a failing tap from
+    /// being retried on every pixel of a slider drag, and ties the error to an app
+    /// that still exists.
+    private var failures: [String: (at: Date, error: TapError?, message: String)] = [:]
+    private static let retryAfter: TimeInterval = 10
+
     /// Refreshed by the device listener rather than re-read per slider tick — this
     /// is a CoreAudio round trip and `syncTaps()` runs on every pixel of a drag.
     private var outputUID: String? = defaultOutputDeviceUID
@@ -47,7 +53,9 @@ final class MixerModel: ObservableObject {
     func isMuted(_ id: String) -> Bool { muted.contains(id) }
 
     func setVolume(_ value: Float, for app: AudioApp) {
-        volumes[app.id] = value
+        // A continuous slider almost never lands on exactly 1.0, which is the only
+        // value that drops the tap; treat "close to 100%" as 100%.
+        volumes[app.id] = abs(value - 1) < 0.02 ? 1 : value
         syncTaps()
         persistSoon()
     }
@@ -85,15 +93,19 @@ final class MixerModel: ObservableObject {
             taps[id]?.stop()
             taps[id] = nil
         }
+        failures = failures.filter { alive.contains($0.key) }
 
         for app in apps {
             let gain = isMuted(app.id) ? 0 : volume(app.id)
 
             // At 100% and unmuted, drop the tap so the app keeps its native,
-            // zero-latency path. Nothing to do for apps that aren't playing yet.
-            guard gain != 1.0, app.isPlaying else {
+            // zero-latency path. Otherwise keep it even while the app is silent:
+            // tapping only once playback is noticed (a 2 s poll) lets a muted app's
+            // short sounds, like notification chimes, through at full volume.
+            guard gain != 1.0 else {
                 taps[app.id]?.stop()
                 taps[app.id] = nil
+                failures[app.id] = nil
                 continue
             }
 
@@ -106,17 +118,20 @@ final class MixerModel: ObservableObject {
                 taps[app.id] = nil
             }
 
+            if let failed = failures[app.id], Date().timeIntervalSince(failed.at) < Self.retryAfter { continue }
             do {
                 let tap = try AppTap(app: app)
                 tap.gain = gain
                 taps[app.id] = tap
-                error = nil
-                errorIsPermission = false
+                failures[app.id] = nil
             } catch {
-                self.error = error.localizedDescription
-                self.errorIsPermission = (error as? TapError)?.isPermissionProblem ?? false
+                failures[app.id] = (Date(), error as? TapError, error.localizedDescription)
             }
         }
+
+        let shown = failures.values.max { $0.at < $1.at }
+        error = shown?.message
+        errorIsPermission = shown?.error?.isPermissionProblem ?? false
     }
 
     /// Rebuild taps when the user plugs in headphones — the aggregate device pins
@@ -146,7 +161,8 @@ final class MixerModel: ObservableObject {
                 handler(self)
             }
         }
-        _ = AudioObjectAddPropertyListenerBlock(object, &addr, DispatchQueue.main, block)
+        logFailure(AudioObjectAddPropertyListenerBlock(object, &addr, DispatchQueue.main, block),
+                   "AudioObjectAddPropertyListenerBlock")
     }
 }
 
@@ -182,7 +198,7 @@ struct MixerView: View {
                     if model.errorIsPermission {
                         Button("Open Privacy Settings") {
                             NSWorkspace.shared.open(URL(string:
-                                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
+                                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
                         }
                         .font(.caption)
                     }
@@ -211,7 +227,7 @@ struct MixerView: View {
                 .buttonStyle(.borderless)
                 .foregroundStyle(isMuted ? Color.red : Color.secondary)
 
-                Text("\(Int(volume * 100))%")
+                Text("\(Int((volume * 100).rounded()))%")
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
                     .frame(width: 44, alignment: .trailing)

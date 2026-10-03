@@ -51,7 +51,7 @@ var defaultOutputDeviceUID: String? {
 /// One row in the mixer. An app can play through several processes (browser and
 /// Electron audio lives in helper XPC processes), so a row owns a list of them
 /// and gets a single tap covering all.
-struct AudioApp: Identifiable, Hashable {
+struct AudioApp: Identifiable {
     let id: String              // parent bundle ID, or executable path when unbundled
     let name: String
     let bundlePath: String?

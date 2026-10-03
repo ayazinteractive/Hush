@@ -5,12 +5,16 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-permissions:
-  contents: write
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -19,18 +23,25 @@ jobs:
       - name: Build
         run: ./build.sh
 
+      # --list exits 1 when no app has audio, which is normal on a runner;
+      # anything else (a crash, a missing slice) fails the build.
       - name: Smoke check
-        run: ./Hush.app/Contents/MacOS/Hush --list || true   # exits 1 when nothing is playing
+        run: |
+          lipo -archs Hush.app/Contents/MacOS/Hush | grep -q x86_64
+          ./Hush.app/Contents/MacOS/Hush --list || [ $? -eq 1 ]
 
       # ditto, not zip — it preserves the bundle's code signature.
       - name: Package
         run: ditto -c -k --sequesterRsrc --keepParent Hush.app Hush.zip
 
+      # Re-running a tag build replaces the asset instead of failing on the existing release.
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${GITHUB_REF_NAME}" Hush.zip --generate-notes
+        run: |
+          gh release create "$GITHUB_REF_NAME" Hush.zip --generate-notes \
+            || gh release upload "$GITHUB_REF_NAME" Hush.zip --clobber
 
       - uses: actions/upload-artifact@v4
         with:

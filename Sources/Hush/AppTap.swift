@@ -1,25 +1,20 @@
 import CoreAudio
 import Accelerate
 import Synchronization
-import AVFoundation
 
 enum TapError: LocalizedError {
     case os(String, OSStatus)
     case noOutputDevice
     case unsupportedFormat
-    case permissionDenied
 
     var errorDescription: String? {
         switch self {
-        case .permissionDenied:
-            return "Hush needs permission to capture audio."
         case .os(let what, let status):
-            // Creating the tap is what triggers the system prompt, so a failure
-            // here while permission is still undecided is almost always the user
-            // not having answered it yet — say that instead of an OSStatus.
-            if what.contains("ProcessTap"),
-               AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
-                return "Allow audio capture when macOS asks, then try again."
+            // There is no public API to read the audio capture permission (it is not
+            // the microphone one), and a refused tap returns a bare OSStatus. Creating
+            // the tap is what asks, so a failure here is almost always the permission.
+            if isPermissionProblem {
+                return "Hush can't capture this app's audio. Allow Hush under System Audio Recording, then try again."
             }
             return "\(what) failed (\(status))"
         case .noOutputDevice:
@@ -31,7 +26,7 @@ enum TapError: LocalizedError {
 
     /// Whether the fix is a trip to System Settings, so the UI can offer the button.
     var isPermissionProblem: Bool {
-        if case .permissionDenied = self { return true }
+        if case .os(let what, _) = self { return what == "AudioHardwareCreateProcessTap" }
         return false
     }
 }
@@ -70,12 +65,6 @@ final class AppTap {
     private var tapChannels = 2
 
     init(app: AudioApp) throws {
-        // Checking the status beats mapping OSStatus codes: a denied tap and a
-        // failed-for-other-reasons tap are indistinguishable from the return value.
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .denied, .restricted: throw TapError.permissionDenied
-        default: break
-        }
         guard let outputUID = defaultOutputDeviceUID else { throw TapError.noOutputDevice }
         self.outputUID = outputUID
         processIDs = app.processIDs
@@ -153,6 +142,13 @@ final class AppTap {
             lastGain = target
             return
         }
+        // Non-interleaved output (one buffer per channel) fed by the tap's single
+        // interleaved stereo buffer: split it, or L/R would alternate inside one channel.
+        if ins.count == 1, ins[0].mNumberChannels > 1, outs.count > 1 {
+            renderSplit(ins, outs, target: target, lo: &lo, hi: &hi)
+            lastGain = target
+            return
+        }
 
         for i in 0..<outs.count {
             guard let dst = outs[i].mData else { continue }
@@ -205,8 +201,33 @@ final class AppTap {
                            dst + ch, vDSP_Stride(outChannels), n)
             }
         }
-        for ch in tapChannels..<outChannels {
-            vDSP_vclr(dst + ch, vDSP_Stride(outChannels), n)
+        if outChannels > tapChannels {      // a mono output just keeps the left channel
+            for ch in tapChannels..<outChannels {
+                vDSP_vclr(dst + ch, vDSP_Stride(outChannels), n)
+            }
+        }
+    }
+
+    /// One interleaved input buffer into one buffer per output channel.
+    private func renderSplit(_ ins: UnsafeMutableAudioBufferListPointer,
+                             _ outs: UnsafeMutableAudioBufferListPointer,
+                             target: Float, lo: inout Float, hi: inout Float) {
+        guard let srcRaw = ins[0].mData else { return }
+        let src = srcRaw.assumingMemoryBound(to: Float.self)
+        let inChannels = Int(ins[0].mNumberChannels)
+        let inFrames = Int(ins[0].mDataByteSize) / (4 * inChannels)
+        for i in 0..<outs.count {
+            guard let dstRaw = outs[i].mData else { continue }
+            let frames = min(inFrames, Int(outs[i].mDataByteSize) / 4)
+            guard i < inChannels, frames > 0 else {
+                memset(dstRaw, 0, Int(outs[i].mDataByteSize)); continue
+            }
+            let dst = dstRaw.assumingMemoryBound(to: Float.self)
+            let n = vDSP_Length(frames)
+            var start = lastGain
+            var step = (target - start) / Float(frames)
+            vDSP_vrampmul(src + i, vDSP_Stride(inChannels), &start, &step, dst, 1, n)
+            if target > 1 || lastGain > 1 { vDSP_vclip(dst, 1, &lo, &hi, dst, 1, n) }
         }
     }
 
@@ -214,21 +235,27 @@ final class AppTap {
         guard status == noErr else { stop(); throw TapError.os(what, status) }
     }
 
+    /// Order matters: AudioDeviceStop waits for an in-flight render(), which is what
+    /// makes the `unowned(unsafe)` capture safe. Don't destroy anything before it.
     func stop() {
         if let procID, aggID != kAudioObjectUnknown {
-            AudioDeviceStop(aggID, procID)
-            AudioDeviceDestroyIOProcID(aggID, procID)
+            logFailure(AudioDeviceStop(aggID, procID), "AudioDeviceStop")
+            logFailure(AudioDeviceDestroyIOProcID(aggID, procID), "AudioDeviceDestroyIOProcID")
             self.procID = nil
         }
         if aggID != kAudioObjectUnknown {
-            AudioHardwareDestroyAggregateDevice(aggID)
+            logFailure(AudioHardwareDestroyAggregateDevice(aggID), "AudioHardwareDestroyAggregateDevice")
             aggID = AudioObjectID(kAudioObjectUnknown)
         }
         if tapID != kAudioObjectUnknown {
-            AudioHardwareDestroyProcessTap(tapID)
+            logFailure(AudioHardwareDestroyProcessTap(tapID), "AudioHardwareDestroyProcessTap")
             tapID = AudioObjectID(kAudioObjectUnknown)
         }
     }
 
     deinit { stop() }
+}
+
+func logFailure(_ status: OSStatus, _ what: String) {
+    if status != noErr { NSLog("Hush: %@ failed (%d)", what, status) }
 }

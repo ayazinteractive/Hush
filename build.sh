@@ -4,18 +4,25 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-swift build -c release
+# Universal binary: one slice per architecture, then lipo. Cross-compiling with a
+# target triple works with just the command line tools; `--arch a --arch b` needs Xcode.
+BINS=()
+for ARCH in arm64 x86_64; do
+    OPTS=(-c release --triple "$ARCH-apple-macosx15.0" --scratch-path ".build/$ARCH")
+    swift build "${OPTS[@]}"
+    BINS+=("$(swift build "${OPTS[@]}" --show-bin-path)/Hush")
+done
 [ -f AppIcon.icns ] || swift make-icon.swift
 
 # Version comes from the latest tag so a release can't ship claiming an old one.
-VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
+VERSION=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//' || true)
 VERSION=${VERSION:-0.0.0}
 BUILD=$(git rev-list --count HEAD 2>/dev/null || echo 1)
 
 APP="Hush.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp .build/release/Hush "$APP/Contents/MacOS/"
+lipo -create "${BINS[@]}" -output "$APP/Contents/MacOS/Hush"
 cp AppIcon.icns "$APP/Contents/Resources/"
 
 cat > "$APP/Contents/Info.plist" <<PLIST

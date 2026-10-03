@@ -1,10 +1,10 @@
 import AppKit
 import CoreAudio
-import AVFoundation
 
 // Creates a real tap and prints its format — the only way to check the
 // float32 guard in AppTap without dragging a slider. Needs the audio
-// capture permission, so run the copy inside Hush.app.
+// capture permission, so run the copy inside Hush.app. Debug builds only.
+#if DEBUG
 if CommandLine.arguments.contains("--tapfmt") {
     guard let app = AudioApp.all().first(where: \.isPlaying) else {
         print("nothing playing"); exit(1)
@@ -25,6 +25,7 @@ if CommandLine.arguments.contains("--tapfmt") {
           + "\(f.mBitsPerChannel)-bit float=\(isFloat)")
     exit(f.mFormatID == kAudioFormatLinearPCM && isFloat && f.mBitsPerChannel == 32 ? 0 : 1)
 }
+#endif
 
 // `--list` is the runnable check: no UI, no bundle, prints what CoreAudio sees.
 if CommandLine.arguments.contains("--list") {
@@ -32,10 +33,8 @@ if CommandLine.arguments.contains("--list") {
     for a in apps {
         print("\(a.isPlaying ? "▶" : " ") \(a.name)\t\(a.id)\t\(a.processIDs.count) process(es)")
     }
-    let auth = AVCaptureDevice.authorizationStatus(for: .audio)
     print("\(apps.count) app(s), \(apps.filter(\.isPlaying).count) playing, "
-          + "output device: \(defaultOutputDeviceUID ?? "none"), "
-          + "audio capture: \(["notDetermined", "restricted", "denied", "authorized"][auth.rawValue])")
+          + "output device: \(defaultOutputDeviceUID ?? "none")")
     exit(apps.isEmpty ? 1 : 0)
 }
 
